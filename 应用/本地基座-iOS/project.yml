@@ -19,6 +19,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cn.local.phonebase.local
         PRODUCT_NAME: PhoneBaseLocal
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: false
         INFOPLIST_FILE: PhoneBaseLocal/Info.plist
         CODE_SIGN_ENTITLEMENTS: PhoneBaseLocal/PhoneBaseLocal.entitlements
