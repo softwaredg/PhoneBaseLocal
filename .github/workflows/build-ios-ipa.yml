@@ -14,7 +14,7 @@ permissions:
 jobs:
   build:
     name: macOS unsigned IPA (TrollStore)
-    runs-on: macos-15
+    runs-on: macos-13
     defaults:
       run:
         working-directory: 应用/本地基座-iOS
