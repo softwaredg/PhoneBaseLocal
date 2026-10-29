@@ -5,6 +5,7 @@ import CommonCrypto
 final class LocalHTTPServer {
     private let port: UInt16
     private var listener: NWListener?
+    private var bonjour: NetService?
     private let queue = DispatchQueue(label: "cn.local.phonebase.local.http")
 
     var onInfo: (() -> Data)?
@@ -12,31 +13,36 @@ final class LocalHTTPServer {
     var onVideoConnect: ((WebSocketSession) -> Void)?
     var onControlConnect: ((WebSocketSession) -> Void)?
 
+    /// Bonjour 展示名 / TXT（与 TCP 监听解耦，避免 mDNS 失败拖垮 HTTP）
+    var bonjourName: String = "PhoneBaseLocal"
+    var bonjourTXT: [String: String] = [:]
+
     init(port: UInt16) {
         self.port = port
     }
 
-    /// 可选 Bonjour 名称 / TXT（桌面扫描走 HTTP，官方客户端可走 mDNS）
-    var bonjourName: String = "PhoneBaseLocal"
-    var bonjourTXT: [String: String] = [:]
-
     func start() throws {
-        let params = NWParameters.tcp
+        let tcp = NWProtocolTCP.Options()
+        tcp.enableKeepalive = true
+        tcp.keepaliveIdle = 10
+        let params = NWParameters(tls: nil, tcp: tcp)
         params.allowLocalEndpointReuse = true
+        params.includePeerToPeer = true
+
         let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
-        var txt = NWTXTRecord()
-        for (k, v) in bonjourTXT {
-            txt[k] = v
-        }
-        // 名字过长会导致 publish 失败；截断到安全长度
-        let safeName = String(bonjourName.prefix(48))
-        listener.service = NWListener.Service(name: safeName, type: "_phonebase._tcp", txtRecord: txt)
+        // 不在这里挂 listener.service：部分机型上 Bonjour 注册异常会导致连接无响应
         listener.newConnectionHandler = { [weak self] connection in
             self?.handle(connection: connection)
         }
-        listener.stateUpdateHandler = { state in
-            if case .failed(let error) = state {
+        listener.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                NSLog("[HTTP] listener ready on %u", self?.port ?? 0)
+                self?.publishBonjour()
+            case .failed(let error):
                 NSLog("[HTTP] listener failed: %@", "\(error)")
+            default:
+                break
             }
         }
         listener.start(queue: queue)
@@ -44,13 +50,44 @@ final class LocalHTTPServer {
     }
 
     func stop() {
+        bonjour?.stop()
+        bonjour = nil
         listener?.cancel()
         listener = nil
     }
 
+    private func publishBonjour() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.bonjour?.stop()
+            let name = String(self.bonjourName.prefix(48))
+            let svc = NetService(domain: "local.", type: "_phonebase._tcp.", name: name, port: Int32(self.port))
+            var dict: [String: Data] = [:]
+            for (k, v) in self.bonjourTXT {
+                dict[k] = Data(v.utf8)
+            }
+            svc.setTXTRecord(NetService.data(fromTXTRecord: dict))
+            svc.publish()
+            self.bonjour = svc
+            NSLog("[HTTP] bonjour published name=%@", name)
+        }
+    }
+
     private func handle(connection: NWConnection) {
+        connection.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready:
+                self?.receiveHeader(connection: connection, accumulated: Data())
+            case .failed(let error):
+                NSLog("[HTTP] conn failed: %@", "\(error)")
+                connection.cancel()
+            case .cancelled:
+                break
+            default:
+                break
+            }
+        }
         connection.start(queue: queue)
-        receiveHeader(connection: connection, accumulated: Data())
     }
 
     private func receiveHeader(connection: NWConnection, accumulated: Data) {
@@ -110,9 +147,12 @@ final class LocalHTTPServer {
         }
 
         if method == "GET" && path == "/api/info" {
+            // UIKit 相关字段已在 BaseRuntime 侧缓存；这里只取 JSON
             respond(connection: connection, status: 200, contentType: "application/json", body: onInfo?() ?? Data("{}".utf8))
         } else if method == "GET" && path == "/api/health" {
             respond(connection: connection, status: 200, contentType: "application/json", body: onHealth?() ?? Data("{}".utf8))
+        } else if method == "OPTIONS" {
+            respond(connection: connection, status: 204, contentType: "text/plain", body: Data())
         } else {
             respond(connection: connection, status: 404, contentType: "text/plain", body: Data("not found".utf8))
         }
@@ -138,9 +178,7 @@ final class LocalHTTPServer {
                 return
             }
             let session = WebSocketSession(connection: connection, queue: self?.queue ?? .main)
-            if !leftover.isEmpty {
-                // leftover after header rarely contains WS frames; ignore for simplicity
-            }
+            _ = leftover
             session.start()
             if path == "/video" {
                 self?.onVideoConnect?(session)
@@ -151,7 +189,12 @@ final class LocalHTTPServer {
     }
 
     private func respond(connection: NWConnection, status: Int, contentType: String, body: Data) {
-        let reason = status == 200 ? "OK" : "ERR"
+        let reason: String
+        switch status {
+        case 200: reason = "OK"
+        case 204: reason = "No Content"
+        default: reason = "ERR"
+        }
         var header = "HTTP/1.1 \(status) \(reason)\r\n"
         header += "Content-Type: \(contentType)\r\n"
         header += "Content-Length: \(body.count)\r\n"
