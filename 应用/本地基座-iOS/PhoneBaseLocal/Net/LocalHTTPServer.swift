@@ -2,14 +2,18 @@ import Foundation
 import Darwin
 import CommonCrypto
 
-/// BSD socket HTTP 服务：解决部分机型 Network.framework「TCP 能连但 /api/* 无回包」。
+/// BSD socket HTTP 服务。
 final class LocalHTTPServer {
     private let port: UInt16
     private var listenFd: Int32 = -1
     private var running = false
-    private let queue = DispatchQueue(label: "cn.local.phonebase.local.http", attributes: .concurrent)
+    private let queue = DispatchQueue(label: "cn.local.phonebase.local.http")
     private let acceptQueue = DispatchQueue(label: "cn.local.phonebase.local.accept")
     private var bonjour: NetService?
+
+    private(set) var acceptCount: Int = 0
+    private(set) var lastClient: String = ""
+    var onAccepted: ((Int, String) -> Void)?
 
     var onInfo: (() -> Data)?
     var onHealth: (() -> Data)?
@@ -26,20 +30,22 @@ final class LocalHTTPServer {
     func start() throws {
         stop()
 
-        let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
         guard fd >= 0 else { throw ServerError.socket }
         listenFd = fd
 
         var yes: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+        // 关闭 Nagle，尽快回包
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
 
         var addr = sockaddr_in()
         memset(&addr, 0, MemoryLayout<sockaddr_in>.size)
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = in_port_t(port).bigEndian
-        addr.sin_addr = in_addr(s_addr: in_addr_t(0)) // INADDR_ANY
+        addr.sin_addr = in_addr(s_addr: in_addr_t(0))
 
         let bindOk = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -51,13 +57,14 @@ final class LocalHTTPServer {
             listenFd = -1
             throw ServerError.bind(errno)
         }
-        guard Darwin.listen(fd, 32) == 0 else {
+        guard Darwin.listen(fd, 64) == 0 else {
             Darwin.close(fd)
             listenFd = -1
             throw ServerError.listen(errno)
         }
 
         running = true
+        acceptCount = 0
         NSLog("[HTTP] BSD listen ready port=%u fd=%d", port, fd)
         acceptQueue.async { [weak self] in self?.acceptLoop() }
         DispatchQueue.main.async { [weak self] in self?.publishBonjour() }
@@ -81,13 +88,12 @@ final class LocalHTTPServer {
         svc.setTXTRecord(NetService.data(fromTXTRecord: dict))
         svc.publish()
         bonjour = svc
-        NSLog("[HTTP] bonjour published name=%@", name)
     }
 
     private func acceptLoop() {
         while running {
-            var addr = sockaddr_storage()
-            var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            var addr = sockaddr_in()
+            var len = socklen_t(MemoryLayout<sockaddr_in>.size)
             let client = withUnsafeMutablePointer(to: &addr) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                     Darwin.accept(self.listenFd, $0, &len)
@@ -96,49 +102,76 @@ final class LocalHTTPServer {
             if client < 0 {
                 if errno == EINTR { continue }
                 if !running { break }
-                usleep(30_000)
+                usleep(20_000)
                 continue
             }
+
             var yes: Int32 = 1
             setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
-            var tv = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+            var tv = timeval(tv_sec: 3, tv_usec: 0)
             setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
+
+            var host = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            inet_ntop(AF_INET, &addr.sin_addr, &host, socklen_t(INET_ADDRSTRLEN))
+            let ip = String(cString: host)
+            acceptCount += 1
+            lastClient = ip
+            let n = acceptCount
+            DispatchQueue.main.async { [weak self] in self?.onAccepted?(n, ip) }
+
+            // 串行处理，避免并发把调试搞乱；连接不多
             queue.async { [weak self] in
-                self?.handleClient(fd: client)
+                self?.handleClient(fd: client, peer: ip)
             }
         }
     }
 
-    private func handleClient(fd: Int32) {
+    private func handleClient(fd: Int32, peer: String) {
         var transferred = false
         defer {
-            if !transferred {
-                Darwin.close(fd)
-            }
+            if !transferred { Darwin.close(fd) }
         }
 
         var buf = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
-        while true {
+        let deadline = Date().addingTimeInterval(3)
+
+        while Date() < deadline {
             let n = Darwin.recv(fd, &tmp, tmp.count, 0)
-            if n < 0 {
-                let err = errno
-                if err == EINTR { continue }
-                return
+            if n > 0 {
+                buf.append(contentsOf: tmp.prefix(Int(n)))
+                if let range = buf.range(of: Data("\r\n\r\n".utf8)) {
+                    let headerData = buf.subdata(in: buf.startIndex..<range.lowerBound)
+                    let leftover = buf.subdata(in: range.upperBound..<buf.endIndex)
+                    transferred = route(fd: fd, headerData: headerData, leftover: leftover)
+                    return
+                }
+                if buf.count > 64 * 1024 { return }
+                continue
             }
-            if n == 0 { return }
-            buf.append(contentsOf: tmp.prefix(Int(n)))
-            if let range = buf.range(of: Data("\r\n\r\n".utf8)) {
-                let headerData = buf.subdata(in: buf.startIndex..<range.lowerBound)
-                let leftover = buf.subdata(in: range.upperBound..<buf.endIndex)
-                transferred = route(fd: fd, headerData: headerData, leftover: leftover)
-                return
+            if n == 0 {
+                // 对端关闭；若已有部分数据也试着回
+                break
             }
-            if buf.count > 64 * 1024 { return }
+            let err = errno
+            if err == EINTR { continue }
+            // 超时或其它：若已收到完整头就处理，否则用探针回包证明本进程在听
+            break
         }
+
+        if let range = buf.range(of: Data("\r\n\r\n".utf8)) {
+            let headerData = buf.subdata(in: buf.startIndex..<range.lowerBound)
+            let leftover = buf.subdata(in: range.upperBound..<buf.endIndex)
+            transferred = route(fd: fd, headerData: headerData, leftover: leftover)
+            return
+        }
+
+        // 没读到完整 HTTP：仍回一个明确 JSON，便于判断「本进程是否接到了连接」
+        let json = "{\"ok\":false,\"error\":\"no-http-request\",\"peer\":\"\(peer)\",\"bytes\":\(buf.count),\"accept\":\(acceptCount)}"
+        respond(fd: fd, status: 408, contentType: "application/json", body: Data(json.utf8))
     }
 
-    /// 返回 true 表示 fd 已移交给 WebSocketSession，调用方不要 close。
     @discardableResult
     private func route(fd: Int32, headerData: Data, leftover: Data) -> Bool {
         guard let header = String(data: headerData, encoding: .utf8) else { return false }
@@ -191,21 +224,13 @@ final class LocalHTTPServer {
             guard let base = raw.baseAddress else { return -1 }
             return Darwin.send(fd, base, data.count, 0)
         }
-        // 清掉读超时，长连接视频/控制需要阻塞读
         var tv = timeval(tv_sec: 0, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
-
         let session = WebSocketSession(socketFd: fd, queue: queue)
         session.takeOwnership()
-        if !leftover.isEmpty {
-            // 握手后很少夹带帧；忽略
-        }
+        _ = leftover
         session.start()
-        if path == "/video" {
-            onVideoConnect?(session)
-        } else {
-            onControlConnect?(session)
-        }
+        if path == "/video" { onVideoConnect?(session) } else { onControlConnect?(session) }
         return true
     }
 
@@ -214,6 +239,7 @@ final class LocalHTTPServer {
         switch status {
         case 200: reason = "OK"
         case 204: reason = "No Content"
+        case 408: reason = "Request Timeout"
         default: reason = "ERR"
         }
         var header = "HTTP/1.1 \(status) \(reason)\r\n"
@@ -222,6 +248,7 @@ final class LocalHTTPServer {
         header += "Connection: close\r\n"
         header += "Access-Control-Allow-Origin: *\r\n"
         header += "Cache-Control: no-store\r\n"
+        header += "X-PhoneBase: local\r\n"
         header += "\r\n"
         var packet = Data(header.utf8)
         packet.append(body)

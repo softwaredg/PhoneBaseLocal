@@ -5,7 +5,9 @@ final class RootViewController: UIViewController {
     private let titleLabel = UILabel()
     private let statusLabel = UILabel()
     private let ipLabel = UILabel()
+    private let selfTestLabel = UILabel()
     private let toggleButton = UIButton(type: .system)
+    private let selfTestButton = UIButton(type: .system)
 
     init(runtime: BaseRuntime) {
         self.runtime = runtime
@@ -31,15 +33,22 @@ final class RootViewController: UIViewController {
         ipLabel.textColor = UIColor(white: 0.55, alpha: 1)
         ipLabel.numberOfLines = 0
 
+        selfTestLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        selfTestLabel.textColor = UIColor(red: 0.85, green: 0.75, blue: 0.35, alpha: 1)
+        selfTestLabel.numberOfLines = 0
+        selfTestLabel.text = "点「本机自检」验证 /api/health 是否本进程在响应"
+
         toggleButton.setTitle("停止服务", for: .normal)
-        toggleButton.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
-        toggleButton.backgroundColor = UIColor(red: 0.18, green: 0.62, blue: 0.48, alpha: 1)
-        toggleButton.setTitleColor(.white, for: .normal)
-        toggleButton.layer.cornerRadius = 10
-        toggleButton.contentEdgeInsets = UIEdgeInsets(top: 12, left: 18, bottom: 12, right: 18)
+        stylePrimary(toggleButton, color: UIColor(red: 0.18, green: 0.62, blue: 0.48, alpha: 1))
         toggleButton.addTarget(self, action: #selector(toggle), for: .touchUpInside)
 
-        let stack = UIStackView(arrangedSubviews: [titleLabel, statusLabel, ipLabel, toggleButton])
+        selfTestButton.setTitle("本机自检", for: .normal)
+        stylePrimary(selfTestButton, color: UIColor(red: 0.20, green: 0.45, blue: 0.85, alpha: 1))
+        selfTestButton.addTarget(self, action: #selector(runSelfTest), for: .touchUpInside)
+
+        let stack = UIStackView(arrangedSubviews: [
+            titleLabel, statusLabel, ipLabel, selfTestLabel, toggleButton, selfTestButton,
+        ])
         stack.axis = .vertical
         stack.spacing = 14
         stack.alignment = .leading
@@ -59,6 +68,19 @@ final class RootViewController: UIViewController {
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             self?.refreshIP()
         }
+
+        // 启动后自动自检一次
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.runSelfTest()
+        }
+    }
+
+    private func stylePrimary(_ button: UIButton, color: UIColor) {
+        button.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
+        button.backgroundColor = color
+        button.setTitleColor(.white, for: .normal)
+        button.layer.cornerRadius = 10
+        button.contentEdgeInsets = UIEdgeInsets(top: 12, left: 18, bottom: 12, right: 18)
     }
 
     private func refreshIP() {
@@ -78,5 +100,43 @@ final class RootViewController: UIViewController {
             toggleButton.setTitle("停止服务", for: .normal)
         }
         refreshIP()
+    }
+
+    @objc private func runSelfTest() {
+        selfTestLabel.text = "自检中…"
+        let port = runtime.port
+        let lan = LanAddress.ipv4List().first
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let local = Self.fetch("http://127.0.0.1:\(port)/api/health")
+            let lanResult: String
+            if let lan {
+                lanResult = Self.fetch("http://\(lan):\(port)/api/health")
+            } else {
+                lanResult = "无局域网 IP"
+            }
+            DispatchQueue.main.async {
+                self?.selfTestLabel.text = "本机自检\n127.0.0.1 → \(local)\nLAN → \(lanResult)\n\n电脑连入时上方应出现「有连接 #N」"
+            }
+        }
+    }
+
+    private static func fetch(_ url: String) -> String {
+        guard let u = URL(string: url) else { return "bad-url" }
+        var req = URLRequest(url: u, timeoutInterval: 2.5)
+        req.httpMethod = "GET"
+        let sem = DispatchSemaphore(value: 0)
+        var out = "timeout"
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            defer { sem.signal() }
+            if let err {
+                out = "err:\(err.localizedDescription)"
+                return
+            }
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            let body = String(data: data ?? Data(), encoding: .utf8) ?? ""
+            out = "HTTP \(code) \(body)"
+        }.resume()
+        _ = sem.wait(timeout: .now() + 3)
+        return out
     }
 }
