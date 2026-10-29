@@ -16,10 +16,21 @@ final class LocalHTTPServer {
         self.port = port
     }
 
+    /// 可选 Bonjour 名称 / TXT（桌面扫描走 HTTP，官方客户端可走 mDNS）
+    var bonjourName: String = "PhoneBaseLocal"
+    var bonjourTXT: [String: String] = [:]
+
     func start() throws {
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
         let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+        var txt = NWTXTRecord()
+        for (k, v) in bonjourTXT {
+            txt[k] = v
+        }
+        // 名字过长会导致 publish 失败；截断到安全长度
+        let safeName = String(bonjourName.prefix(48))
+        listener.service = NWListener.Service(name: safeName, type: "_phonebase._tcp", txtRecord: txt)
         listener.newConnectionHandler = { [weak self] connection in
             self?.handle(connection: connection)
         }

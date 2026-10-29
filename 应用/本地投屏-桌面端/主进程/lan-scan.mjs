@@ -115,7 +115,7 @@ export function listScanTargets(phonePort = PHONE_PORT, { interfaceAddress = "" 
   };
 }
 
-async function probeQuick(ip, port, timeoutMs = 450) {
+async function probeQuick(ip, port, timeoutMs = 1200) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -163,7 +163,7 @@ export function scanStatusIdle(phonePort = PHONE_PORT) {
 export async function scanLan({
   phonePort = PHONE_PORT,
   concurrency = 48,
-  timeoutMs = 450,
+  timeoutMs = 1200,
   interfaceAddress = "",
   onProgress,
   signal,

@@ -35,6 +35,13 @@ final class BaseRuntime {
         )
         sampler = ScreenSampler(width: encodeW, height: encodeH)
         server = LocalHTTPServer(port: port)
+        server.bonjourName = DeviceIdentity.displayName
+        server.bonjourTXT = [
+            "protocol": "lan-phonebase",
+            "version": "1.0",
+            "deviceId": DeviceIdentity.deviceId,
+            "port": String(port),
+        ]
 
         server.onInfo = { [weak self] in self?.infoJSON() ?? Data() }
         server.onHealth = { #"{"ok":true,"protocol":"lan-phonebase","version":"1.0"}"#.data(using: .utf8)! }
@@ -92,6 +99,7 @@ final class BaseRuntime {
             "version": "1.0",
             "deviceId": DeviceIdentity.deviceId,
             "name": DeviceIdentity.displayName,
+            "port": Int(port),
             "streaming": sampler.isActive,
             "width": size.width,
             "height": size.height,

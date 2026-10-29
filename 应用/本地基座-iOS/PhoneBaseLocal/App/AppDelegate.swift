@@ -13,6 +13,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         window.rootViewController = RootViewController(runtime: runtime)
         window.makeKeyAndVisible()
         self.window = window
+        LocalNetworkPermission.shared.requestIfNeeded()
         runtime.start()
         return true
     }

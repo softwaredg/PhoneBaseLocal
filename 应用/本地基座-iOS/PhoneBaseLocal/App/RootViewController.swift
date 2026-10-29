@@ -63,7 +63,10 @@ final class RootViewController: UIViewController {
 
     private func refreshIP() {
         let ips = LanAddress.ipv4List().joined(separator: "\n")
-        ipLabel.text = "端口 \(runtime.port)\n\(ips.isEmpty ? "等待局域网地址…" : ips)\n\n电脑 Electron / local-client 填上述 IP"
+        let tip = ips.isEmpty
+            ? "等待局域网地址…\n请确认手机已连 Wi‑Fi（勿用访客网络）"
+            : "电脑端「手动添加」填：\n\(ips.split(separator: "\n").first ?? "")\n端口 \(runtime.port)"
+        ipLabel.text = "端口 \(runtime.port)\n\(ips.isEmpty ? "无局域网 IP" : ips)\n\n\(tip)"
     }
 
     @objc private func toggle() {
