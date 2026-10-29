@@ -121,8 +121,8 @@ final class LocalHTTPServer {
             let n = acceptCount
             DispatchQueue.main.async { [weak self] in self?.onAccepted?(n, ip) }
 
-            // 串行处理，避免并发把调试搞乱；连接不多
-            queue.async { [weak self] in
+            // 每连接独立线程，彻底避开 GCD 队列被 WebSocket/慢连接拖死
+            Thread.detachNewThread { [weak self] in
                 self?.handleClient(fd: client, peer: ip)
             }
         }

@@ -97,12 +97,22 @@ async function start() {
     return;
   }
   setScreen("正在连接设备", "读取 /api/info…");
-  const t0 = performance.now();
-  const body = await window.desktopLocal.probeInfo(ip, port);
-  const rtt = Math.round(performance.now() - t0);
-  setRtt(rtt);
-  if (!body.ok) {
-    setScreen("连接失败", body.error || "探测失败");
+  let body;
+  let rtt = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const t0 = performance.now();
+    body = await window.desktopLocal.probeInfo(ip, port);
+    rtt = Math.round(performance.now() - t0);
+    setRtt(rtt);
+    if (body.ok) break;
+    setScreen("正在连接设备", `第 ${attempt}/3 次失败：${body.error || "探测失败"}`);
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  if (!body?.ok) {
+    setScreen(
+      "连接失败",
+      `${body?.error || "探测失败"}\n请确认手机显示 build=0.1.6-thread-http，并彻底滑掉旧进程后重开`
+    );
     return;
   }
   const info = body.info || {};
