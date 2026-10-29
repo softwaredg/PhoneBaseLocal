@@ -3,6 +3,14 @@ import path from "node:path";
 import net from "node:net";
 import { fileURLToPath } from "node:url";
 import { scanLan, scanStatusIdle, PHONE_PORT } from "./lan-scan.mjs";
+import { lanGetJson } from "./lan-http.mjs";
+
+// 避免 Clash/系统代理把局域网请求拐走
+for (const k of ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY", "all_proxy"]) {
+  if (process.env[k]) delete process.env[k];
+}
+process.env.NO_PROXY = "*";
+process.env.no_proxy = "*";
 
 const DEVICE_HEADER_H = 36;
 const DEVICE_TOOLS_W = 40;
@@ -22,14 +30,6 @@ function isLanIPv4(ip) {
   return false;
 }
 
-async function readJsonLimited(res, limit = 8192) {
-  const len = Number(res.headers.get("content-length") || 0);
-  if (len > limit) throw Object.assign(new Error("response too large"), { code: "TOO_LARGE" });
-  const buf = Buffer.from(await res.arrayBuffer());
-  if (buf.length > limit) throw Object.assign(new Error("response too large"), { code: "TOO_LARGE" });
-  return JSON.parse(buf.toString("utf8"));
-}
-
 async function probeInfo(ip, port) {
   if (!isLanIPv4(ip)) {
     throw Object.assign(new Error("仅允许局域网 IPv4"), { code: "BAD_IP" });
@@ -39,18 +39,8 @@ async function probeInfo(ip, port) {
     throw Object.assign(new Error("端口无效"), { code: "BAD_PORT" });
   }
 
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 2500);
   try {
-    const r = await fetch(`http://${ip}:${p}/api/info`, {
-      signal: ctrl.signal,
-      redirect: "manual",
-      headers: { Accept: "application/json" },
-    });
-    if (!r.ok) {
-      throw Object.assign(new Error(`手机 /api/info HTTP ${r.status}`), { code: "HTTP_ERROR" });
-    }
-    const info = await readJsonLimited(r);
+    const { info } = await lanGetJson(ip, p, "/api/info", { timeoutMs: 8000 });
 
     if (info.protocol && info.protocol !== "lan-phonebase") {
       throw Object.assign(new Error(`未知协议 ${info.protocol}`), { code: "BAD_PROTOCOL", info });
@@ -66,12 +56,10 @@ async function probeInfo(ip, port) {
 
     return { ip, port: p, info };
   } catch (e) {
-    if (e.name === "AbortError") {
+    if (e?.code === "TIMEOUT" || e?.name === "AbortError") {
       throw Object.assign(new Error("探测超时：请确认手机与电脑同网且基座已启动"), { code: "TIMEOUT" });
     }
     throw e;
-  } finally {
-    clearTimeout(timer);
   }
 }
 

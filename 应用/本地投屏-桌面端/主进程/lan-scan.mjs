@@ -1,5 +1,6 @@
 import os from "node:os";
 import net from "node:net";
+import { lanGetJson } from "./lan-http.mjs";
 
 export const PHONE_PORT = 11019;
 
@@ -115,17 +116,9 @@ export function listScanTargets(phonePort = PHONE_PORT, { interfaceAddress = "" 
   };
 }
 
-async function probeQuick(ip, port, timeoutMs = 1200) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+async function probeQuick(ip, port, timeoutMs = 1500) {
   try {
-    const r = await fetch(`http://${ip}:${port}/api/info`, {
-      signal: ctrl.signal,
-      redirect: "manual",
-      headers: { Accept: "application/json" },
-    });
-    if (!r.ok) return null;
-    const info = await r.json();
+    const { info } = await lanGetJson(ip, port, "/api/info", { timeoutMs });
     if (info?.protocol && info.protocol !== "lan-phonebase") return null;
     if (info?.licenseRequired === true) return null;
     return {
@@ -137,8 +130,6 @@ async function probeQuick(ip, port, timeoutMs = 1200) {
     };
   } catch {
     return null;
-  } finally {
-    clearTimeout(timer);
   }
 }
 

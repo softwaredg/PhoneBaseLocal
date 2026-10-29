@@ -7,7 +7,8 @@ final class LocalHTTPServer {
     private let port: UInt16
     private var listenFd: Int32 = -1
     private var running = false
-    private let queue = DispatchQueue(label: "cn.local.phonebase.local.http")
+    /// 每连接并发处理，避免一个慢连接堵住后续 /api/info 探测
+    private let queue = DispatchQueue(label: "cn.local.phonebase.local.http", attributes: .concurrent)
     private let acceptQueue = DispatchQueue(label: "cn.local.phonebase.local.accept")
     private var bonjour: NetService?
 

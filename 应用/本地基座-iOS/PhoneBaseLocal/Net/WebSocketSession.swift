@@ -3,6 +3,7 @@ import Darwin
 
 final class WebSocketSession {
     private var fd: Int32
+    /// 每条 WS 独立队列，绝不能占用 HTTP 处理队列（否则会堵死 /api/info）
     private let queue: DispatchQueue
     private var buffer = Data()
     private var ownsFd = true
@@ -11,9 +12,9 @@ final class WebSocketSession {
     var onClose: (() -> Void)?
     private(set) var isOpen = true
 
-    init(socketFd: Int32, queue: DispatchQueue) {
+    init(socketFd: Int32, queue _: DispatchQueue? = nil) {
         self.fd = socketFd
-        self.queue = queue
+        self.queue = DispatchQueue(label: "cn.local.phonebase.ws.\(socketFd)-\(UUID().uuidString)")
         var yes: Int32 = 1
         setsockopt(socketFd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
     }
