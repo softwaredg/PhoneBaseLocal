@@ -1,19 +1,21 @@
 import Foundation
-import Network
+import Darwin
 import CommonCrypto
 
+/// BSD socket HTTP 服务：解决部分机型 Network.framework「TCP 能连但 /api/* 无回包」。
 final class LocalHTTPServer {
     private let port: UInt16
-    private var listener: NWListener?
+    private var listenFd: Int32 = -1
+    private var running = false
+    private let queue = DispatchQueue(label: "cn.local.phonebase.local.http", attributes: .concurrent)
+    private let acceptQueue = DispatchQueue(label: "cn.local.phonebase.local.accept")
     private var bonjour: NetService?
-    private let queue = DispatchQueue(label: "cn.local.phonebase.local.http")
 
     var onInfo: (() -> Data)?
     var onHealth: (() -> Data)?
     var onVideoConnect: ((WebSocketSession) -> Void)?
     var onControlConnect: ((WebSocketSession) -> Void)?
 
-    /// Bonjour 展示名 / TXT（与 TCP 监听解耦，避免 mDNS 失败拖垮 HTTP）
     var bonjourName: String = "PhoneBaseLocal"
     var bonjourTXT: [String: String] = [:]
 
@@ -22,112 +24,128 @@ final class LocalHTTPServer {
     }
 
     func start() throws {
-        let tcp = NWProtocolTCP.Options()
-        tcp.enableKeepalive = true
-        tcp.keepaliveIdle = 10
-        let params = NWParameters(tls: nil, tcp: tcp)
-        params.allowLocalEndpointReuse = true
-        params.includePeerToPeer = true
+        stop()
 
-        let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
-        // 不在这里挂 listener.service：部分机型上 Bonjour 注册异常会导致连接无响应
-        listener.newConnectionHandler = { [weak self] connection in
-            self?.handle(connection: connection)
-        }
-        listener.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                NSLog("[HTTP] listener ready on %u", self?.port ?? 0)
-                self?.publishBonjour()
-            case .failed(let error):
-                NSLog("[HTTP] listener failed: %@", "\(error)")
-            default:
-                break
+        let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+        guard fd >= 0 else { throw ServerError.socket }
+        listenFd = fd
+
+        var yes: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+
+        var addr = sockaddr_in()
+        memset(&addr, 0, MemoryLayout<sockaddr_in>.size)
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(port).bigEndian
+        addr.sin_addr = in_addr(s_addr: in_addr_t(0)) // INADDR_ANY
+
+        let bindOk = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        listener.start(queue: queue)
-        self.listener = listener
+        guard bindOk == 0 else {
+            Darwin.close(fd)
+            listenFd = -1
+            throw ServerError.bind(errno)
+        }
+        guard Darwin.listen(fd, 32) == 0 else {
+            Darwin.close(fd)
+            listenFd = -1
+            throw ServerError.listen(errno)
+        }
+
+        running = true
+        NSLog("[HTTP] BSD listen ready port=%u fd=%d", port, fd)
+        acceptQueue.async { [weak self] in self?.acceptLoop() }
+        DispatchQueue.main.async { [weak self] in self?.publishBonjour() }
     }
 
     func stop() {
+        running = false
         bonjour?.stop()
         bonjour = nil
-        listener?.cancel()
-        listener = nil
+        if listenFd >= 0 {
+            Darwin.close(listenFd)
+            listenFd = -1
+        }
     }
 
     private func publishBonjour() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.bonjour?.stop()
-            let name = String(self.bonjourName.prefix(48))
-            let svc = NetService(domain: "local.", type: "_phonebase._tcp.", name: name, port: Int32(self.port))
-            var dict: [String: Data] = [:]
-            for (k, v) in self.bonjourTXT {
-                dict[k] = Data(v.utf8)
+        let name = String(bonjourName.prefix(48))
+        let svc = NetService(domain: "local.", type: "_phonebase._tcp.", name: name, port: Int32(port))
+        var dict: [String: Data] = [:]
+        for (k, v) in bonjourTXT { dict[k] = Data(v.utf8) }
+        svc.setTXTRecord(NetService.data(fromTXTRecord: dict))
+        svc.publish()
+        bonjour = svc
+        NSLog("[HTTP] bonjour published name=%@", name)
+    }
+
+    private func acceptLoop() {
+        while running {
+            var addr = sockaddr_storage()
+            var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            let client = withUnsafeMutablePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.accept(self.listenFd, $0, &len)
+                }
             }
-            svc.setTXTRecord(NetService.data(fromTXTRecord: dict))
-            svc.publish()
-            self.bonjour = svc
-            NSLog("[HTTP] bonjour published name=%@", name)
+            if client < 0 {
+                if errno == EINTR { continue }
+                if !running { break }
+                usleep(30_000)
+                continue
+            }
+            var yes: Int32 = 1
+            setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout.size(ofValue: yes)))
+            var tv = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
+            queue.async { [weak self] in
+                self?.handleClient(fd: client)
+            }
         }
     }
 
-    private func handle(connection: NWConnection) {
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state {
-            case .ready:
-                self?.receiveHeader(connection: connection, accumulated: Data())
-            case .failed(let error):
-                NSLog("[HTTP] conn failed: %@", "\(error)")
-                connection.cancel()
-            case .cancelled:
-                break
-            default:
-                break
+    private func handleClient(fd: Int32) {
+        var transferred = false
+        defer {
+            if !transferred {
+                Darwin.close(fd)
             }
         }
-        connection.start(queue: queue)
-    }
 
-    private func receiveHeader(connection: NWConnection, accumulated: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            var buf = accumulated
-            if let data { buf.append(data) }
+        var buf = Data()
+        var tmp = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let n = recv(fd, &tmp, tmp.count, 0)
+            if n < 0 {
+                let err = errno
+                if err == EINTR { continue }
+                return
+            }
+            if n == 0 { return }
+            buf.append(contentsOf: tmp.prefix(Int(n)))
             if let range = buf.range(of: Data("\r\n\r\n".utf8)) {
                 let headerData = buf.subdata(in: buf.startIndex..<range.lowerBound)
-                let rest = buf.subdata(in: range.upperBound..<buf.endIndex)
-                self.route(connection: connection, headerData: headerData, leftover: rest)
+                let leftover = buf.subdata(in: range.upperBound..<buf.endIndex)
+                transferred = route(fd: fd, headerData: headerData, leftover: leftover)
                 return
             }
-            if isComplete || error != nil {
-                connection.cancel()
-                return
-            }
-            if buf.count > 64 * 1024 {
-                connection.cancel()
-                return
-            }
-            self.receiveHeader(connection: connection, accumulated: buf)
+            if buf.count > 64 * 1024 { return }
         }
     }
 
-    private func route(connection: NWConnection, headerData: Data, leftover: Data) {
-        guard let header = String(data: headerData, encoding: .utf8) else {
-            connection.cancel()
-            return
-        }
+    /// 返回 true 表示 fd 已移交给 WebSocketSession，调用方不要 close。
+    @discardableResult
+    private func route(fd: Int32, headerData: Data, leftover: Data) -> Bool {
+        guard let header = String(data: headerData, encoding: .utf8) else { return false }
         let lines = header.split(separator: "\r\n", omittingEmptySubsequences: false).map(String.init)
-        guard let requestLine = lines.first else {
-            connection.cancel()
-            return
-        }
+        guard let requestLine = lines.first else { return false }
         let parts = requestLine.split(separator: " ")
-        guard parts.count >= 2 else {
-            connection.cancel()
-            return
-        }
+        guard parts.count >= 2 else { return false }
         let method = String(parts[0])
         let path = String(parts[1]).split(separator: "?").first.map(String.init) ?? String(parts[1])
 
@@ -142,27 +160,23 @@ final class LocalHTTPServer {
 
         let upgrade = headers["upgrade"]?.lowercased() == "websocket"
         if upgrade && (path == "/video" || path == "/control") {
-            acceptWebSocket(connection: connection, path: path, headers: headers, leftover: leftover)
-            return
+            return acceptWebSocket(fd: fd, path: path, headers: headers, leftover: leftover)
         }
 
         if method == "GET" && path == "/api/info" {
-            // UIKit 相关字段已在 BaseRuntime 侧缓存；这里只取 JSON
-            respond(connection: connection, status: 200, contentType: "application/json", body: onInfo?() ?? Data("{}".utf8))
+            respond(fd: fd, status: 200, contentType: "application/json", body: onInfo?() ?? Data("{}".utf8))
         } else if method == "GET" && path == "/api/health" {
-            respond(connection: connection, status: 200, contentType: "application/json", body: onHealth?() ?? Data("{}".utf8))
+            respond(fd: fd, status: 200, contentType: "application/json", body: onHealth?() ?? Data("{}".utf8))
         } else if method == "OPTIONS" {
-            respond(connection: connection, status: 204, contentType: "text/plain", body: Data())
+            respond(fd: fd, status: 204, contentType: "text/plain", body: Data())
         } else {
-            respond(connection: connection, status: 404, contentType: "text/plain", body: Data("not found".utf8))
+            respond(fd: fd, status: 404, contentType: "text/plain", body: Data("not found".utf8))
         }
+        return false
     }
 
-    private func acceptWebSocket(connection: NWConnection, path: String, headers: [String: String], leftover: Data) {
-        guard let key = headers["sec-websocket-key"] else {
-            connection.cancel()
-            return
-        }
+    private func acceptWebSocket(fd: Int32, path: String, headers: [String: String], leftover: Data) -> Bool {
+        guard let key = headers["sec-websocket-key"] else { return false }
         let accept = WebSocketHandshake.acceptKey(clientKey: key)
         let response = """
         HTTP/1.1 101 Switching Protocols\r
@@ -172,23 +186,30 @@ final class LocalHTTPServer {
         \r
 
         """
-        connection.send(content: Data(response.utf8), completion: .contentProcessed { [weak self] error in
-            guard error == nil else {
-                connection.cancel()
-                return
-            }
-            let session = WebSocketSession(connection: connection, queue: self?.queue ?? .main)
-            _ = leftover
-            session.start()
-            if path == "/video" {
-                self?.onVideoConnect?(session)
-            } else {
-                self?.onControlConnect?(session)
-            }
-        })
+        let data = Data(response.utf8)
+        _ = data.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return -1 }
+            return send(fd, base, data.count, 0)
+        }
+        // 清掉读超时，长连接视频/控制需要阻塞读
+        var tv = timeval(tv_sec: 0, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout.size(ofValue: tv)))
+
+        let session = WebSocketSession(socketFd: fd, queue: queue)
+        session.takeOwnership()
+        if !leftover.isEmpty {
+            // 握手后很少夹带帧；忽略
+        }
+        session.start()
+        if path == "/video" {
+            onVideoConnect?(session)
+        } else {
+            onControlConnect?(session)
+        }
+        return true
     }
 
-    private func respond(connection: NWConnection, status: Int, contentType: String, body: Data) {
+    private func respond(fd: Int32, status: Int, contentType: String, body: Data) {
         let reason: String
         switch status {
         case 200: reason = "OK"
@@ -200,12 +221,20 @@ final class LocalHTTPServer {
         header += "Content-Length: \(body.count)\r\n"
         header += "Connection: close\r\n"
         header += "Access-Control-Allow-Origin: *\r\n"
+        header += "Cache-Control: no-store\r\n"
         header += "\r\n"
         var packet = Data(header.utf8)
         packet.append(body)
-        connection.send(content: packet, completion: .contentProcessed { _ in
-            connection.cancel()
-        })
+        _ = packet.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return -1 }
+            return send(fd, base, packet.count, 0)
+        }
+    }
+
+    enum ServerError: Error {
+        case socket
+        case bind(Int32)
+        case listen(Int32)
     }
 }
 

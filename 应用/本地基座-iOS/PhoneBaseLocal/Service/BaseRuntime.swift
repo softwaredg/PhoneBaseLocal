@@ -77,9 +77,11 @@ final class BaseRuntime {
             try server.start()
             sampler.start()
             isRunning = true
-            notify("服务已启动 · :\(port) · deviceId=\(cachedDeviceId)")
+            let ips = LanAddress.ipv4List().joined(separator: ", ")
+            notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.2-bsd-http\ndeviceId=\(cachedDeviceId)")
         } catch {
-            notify("启动失败: \(error.localizedDescription)")
+            // 端口被旧基座/助手占用时最常见：TCP 能通但本 App 根本没在听
+            notify("启动失败: \(error)\n请卸载其它 PhoneBase/Direct 基座后重开，确保 \(port) 未被占用")
         }
     }
 
@@ -122,8 +124,8 @@ final class BaseRuntime {
             "licenseRequired": false,
             "release": [
                 "product": "local",
-                "version": "0.1.1",
-                "buildId": "local-rebuild-0.1.1-http-fix",
+                "version": "0.1.2",
+                "buildId": "local-rebuild-0.1.2-bsd-http",
             ],
             "geometry": [
                 "width": w,
