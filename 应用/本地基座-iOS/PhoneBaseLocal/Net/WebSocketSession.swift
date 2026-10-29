@@ -54,14 +54,14 @@ final class WebSocketSession {
         guard fd >= 0 else { return }
         _ = frame.withUnsafeBytes { raw -> Int in
             guard let base = raw.baseAddress else { return -1 }
-            return send(fd, base, frame.count, 0)
+            return Darwin.send(fd, base, frame.count, 0)
         }
     }
 
     private func receiveLoop() {
         var tmp = [UInt8](repeating: 0, count: 16 * 1024)
         while isOpen, fd >= 0 {
-            let n = recv(fd, &tmp, tmp.count, 0)
+            let n = Darwin.recv(fd, &tmp, tmp.count, 0)
             if n < 0 {
                 let err = errno
                 if err == EINTR { continue }

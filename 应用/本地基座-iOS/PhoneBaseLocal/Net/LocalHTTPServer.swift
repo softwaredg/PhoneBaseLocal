@@ -120,7 +120,7 @@ final class LocalHTTPServer {
         var buf = Data()
         var tmp = [UInt8](repeating: 0, count: 4096)
         while true {
-            let n = recv(fd, &tmp, tmp.count, 0)
+            let n = Darwin.recv(fd, &tmp, tmp.count, 0)
             if n < 0 {
                 let err = errno
                 if err == EINTR { continue }
@@ -189,7 +189,7 @@ final class LocalHTTPServer {
         let data = Data(response.utf8)
         _ = data.withUnsafeBytes { raw -> Int in
             guard let base = raw.baseAddress else { return -1 }
-            return send(fd, base, data.count, 0)
+            return Darwin.send(fd, base, data.count, 0)
         }
         // 清掉读超时，长连接视频/控制需要阻塞读
         var tv = timeval(tv_sec: 0, tv_usec: 0)
@@ -227,7 +227,7 @@ final class LocalHTTPServer {
         packet.append(body)
         _ = packet.withUnsafeBytes { raw -> Int in
             guard let base = raw.baseAddress else { return -1 }
-            return send(fd, base, packet.count, 0)
+            return Darwin.send(fd, base, packet.count, 0)
         }
     }
 
