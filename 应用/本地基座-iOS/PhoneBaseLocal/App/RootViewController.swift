@@ -140,8 +140,7 @@ final class RootViewController: UIViewController {
     @objc private func freePort() {
         freePortButton.isEnabled = false
         statusLabel.text = "正在释放 \(runtime.port) 端口占用…"
-        let wasRunning = runtime.isRunning
-        if wasRunning { runtime.stop() }
+        if runtime.isRunning { runtime.stop() }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -149,16 +148,17 @@ final class RootViewController: UIViewController {
             DispatchQueue.main.async {
                 var lines: [String] = ["释放端口结果："]
                 if result.killed.isEmpty {
-                    lines.append("未杀到已知冲突进程（可能名称不同/无权限）")
+                    lines.append("未杀到冲突进程（可能无权限，请卸载 Direct/旧基座）")
                 } else {
                     lines.append("已结束：\(result.killed.joined(separator: ", "))")
                 }
                 lines.append(contentsOf: result.notes)
                 self.statusLabel.text = lines.joined(separator: "\n")
 
-                if result.portFree || wasRunning {
-                    self.runtime.start()
-                    self.toggleButton.setTitle(self.runtime.isRunning ? "停止服务" : "启动服务", for: .normal)
+                self.runtime.start()
+                self.toggleButton.setTitle(self.runtime.isRunning ? "停止服务" : "启动服务", for: .normal)
+                if !self.runtime.isRunning {
+                    self.statusLabel.text = (self.statusLabel.text ?? "") + "\n启动仍失败：请卸载其它基座后重开"
                 }
                 self.freePortButton.isEnabled = true
                 self.refreshIP()

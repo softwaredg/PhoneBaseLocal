@@ -1,74 +1,101 @@
 import Foundation
 import Darwin
 
-/// 尝试清掉占用 11019 的其它基座进程（需 TrollStore + no-sandbox 才有机会生效）。
+/// 清掉占用 11019 的其它基座进程（需 TrollStore + 无沙盒才有机会生效）。
 enum PortOccupancy {
-    /// 常见冲突进程名（p_comm 最长 16 字节，匹配前缀即可）
+    /// p_comm 最长 16 字节；含本包旧实例与 Direct 助手
     static let conflictNames: [String] = [
+        "PhoneBaseLocal",
+        "PhoneBaseDirect",
         "DirectPhoneBase",
         "DirectPhoneBas",
-        "LanCaptureHelpe",
         "LanCaptureHelper",
+        "LanCaptureHelpe",
         "PhoneBase",
         "phonebase",
-        "PhoneBaseDirect",
         "PBHelper",
-        "ScreenCaptureKi", // ScreenCaptureKit helper 偶发
     ]
 
     struct Result {
         var killed: [String] = []
         var notes: [String] = []
+        var seen: [String] = []
         var portFree: Bool = false
     }
 
-    /// 杀掉冲突进程，并检测 11019 是否已可 bind。
     static func freePort(_ port: UInt16 = 11019) -> Result {
         var out = Result()
         let selfPid = getpid()
 
-        // 1) 按进程名 SIGTERM → SIGKILL
         let procs = listProcesses()
-        for p in procs {
-            guard p.pid != selfPid, p.pid > 1 else { continue }
-            let hit = conflictNames.contains { name in
-                p.name.caseInsensitiveCompare(String(name.prefix(16))) == .orderedSame
-                    || p.name.lowercased().hasPrefix("direct")
-                    || p.name.lowercased().hasPrefix("lancapture")
-                    || p.name.lowercased() == "phonebase"
-            }
-            // 避免误杀自己：本进程可执行文件名是 PhoneBaseLocal
-            if p.name.hasPrefix("PhoneBaseLocal") { continue }
-            if hit {
-                var ok = Darwin.kill(p.pid, SIGTERM) == 0
-                usleep(80_000)
-                if Darwin.kill(p.pid, 0) == 0 {
-                    ok = Darwin.kill(p.pid, SIGKILL) == 0 || ok
-                }
-                if ok {
-                    out.killed.append("\(p.name)(\(p.pid))")
-                } else {
-                    out.notes.append("kill \(p.name)(\(p.pid)) errno=\(errno)")
-                }
-            }
+        for p in procs where isConflict(p.name) {
+            out.seen.append("\(p.name)(\(p.pid))")
         }
 
-        // 2) killall 兜底（巨魔环境有时可用）
-        for name in ["DirectPhoneBase", "LanCaptureHelper", "PhoneBase"] {
+        // 1) 按进程名 SIGTERM → SIGKILL（含其它 PhoneBaseLocal 实例，跳过自己）
+        for p in procs {
+            guard p.pid != selfPid, p.pid > 1 else { continue }
+            guard isConflict(p.name) else { continue }
+            killPid(p.pid, name: p.name, into: &out)
+        }
+
+        // 2) killall 兜底
+        for name in ["PhoneBaseLocal", "PhoneBaseDirect", "LanCaptureHelper", "DirectPhoneBase", "PhoneBase"] {
             let r = runKillall(name)
             if !r.isEmpty { out.notes.append(r) }
         }
 
-        usleep(200_000)
+        usleep(250_000)
 
-        // 3) 探测端口是否空闲（能 bind 即空闲）
+        // 3) 若仍占用：扫一遍仍存活的冲突进程再强杀
+        if !canBind(port: port) {
+            let again = listProcesses()
+            for p in again {
+                guard p.pid != selfPid, p.pid > 1, isConflict(p.name) else { continue }
+                _ = Darwin.kill(p.pid, SIGKILL)
+                out.notes.append("retry SIGKILL \(p.name)(\(p.pid))")
+            }
+            usleep(200_000)
+        }
+
         out.portFree = canBind(port: port)
+        if out.seen.isEmpty {
+            out.notes.append("未枚举到冲突进程名（可能无 list 权限）")
+        } else {
+            out.notes.append("见过：\(out.seen.joined(separator: ", "))")
+        }
         if out.portFree {
             out.notes.append("端口 \(port) 已可绑定")
         } else {
-            out.notes.append("端口 \(port) 仍被占用（errno=\(errno)）")
+            out.notes.append("端口 \(port) 仍被占用（请卸载 Direct/旧基座后重开）")
         }
         return out
+    }
+
+    private static func isConflict(_ name: String) -> Bool {
+        let lower = name.lowercased()
+        if lower.hasPrefix("phonebaselocal") { return true }
+        if lower.hasPrefix("phonebasedirect") { return true }
+        if lower.hasPrefix("direct") { return true }
+        if lower.hasPrefix("lancapture") { return true }
+        if lower == "phonebase" { return true }
+        return conflictNames.contains { cand in
+            name.caseInsensitiveCompare(String(cand.prefix(16))) == .orderedSame
+        }
+    }
+
+    private static func killPid(_ pid: pid_t, name: String, into out: inout Result) {
+        var ok = Darwin.kill(pid, SIGTERM) == 0
+        usleep(100_000)
+        if Darwin.kill(pid, 0) == 0 {
+            ok = Darwin.kill(pid, SIGKILL) == 0 || ok
+            usleep(50_000)
+        }
+        if ok || Darwin.kill(pid, 0) != 0 {
+            out.killed.append("\(name)(\(pid))")
+        } else {
+            out.notes.append("kill \(name)(\(pid)) errno=\(errno)")
+        }
     }
 
     private struct Proc {
@@ -114,16 +141,11 @@ enum PortOccupancy {
             strdup(name),
             nil,
         ]
-        defer {
-            argv.forEach { if let p = $0 { free(p) } }
-        }
+        defer { argv.forEach { if let p = $0 { free(p) } } }
         let rc = argv.withUnsafeMutableBufferPointer { ptr -> Int32 in
             posix_spawn(&pid, "/usr/bin/killall", nil, nil, ptr.baseAddress, nil)
         }
-        if rc != 0 {
-            // 部分设备无 killall，静默即可
-            return ""
-        }
+        if rc != 0 { return "" }
         var status: Int32 = 0
         waitpid(pid, &status, 0)
         return "killall -9 \(name) status=\(status)"
