@@ -77,17 +77,23 @@ final class BaseRuntime {
         // geometry in /api/info stays full screen points*scale; stream is encodeW×encodeH
     }
 
-    func start() {
-        guard !isRunning else { return }
+    @discardableResult
+    func start(notifyStatus: Bool = true) -> Bool {
+        guard !isRunning else { return true }
         do {
             try server.start()
             sampler.start()
             isRunning = true
-            let ips = LanAddress.ipv4List().joined(separator: ", ")
-            notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.9-free-port\ndeviceId=\(cachedDeviceId)")
+            if notifyStatus {
+                let ips = LanAddress.ipv4List().joined(separator: ", ")
+                notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.10-free-port\ndeviceId=\(cachedDeviceId)")
+            }
+            return true
         } catch {
-            // 端口被旧基座/助手占用时最常见：TCP 能通但本 App 根本没在听
-            notify("启动失败: \(error)\n请卸载其它 PhoneBase/Direct 基座后重开，确保 \(port) 未被占用")
+            if notifyStatus {
+                notify("启动失败: \(error)\n请点「释放端口占用」；若仍失败请卸载 Direct/旧基座后重开")
+            }
+            return false
         }
     }
 
@@ -130,8 +136,8 @@ final class BaseRuntime {
             "licenseRequired": false,
             "release": [
                 "product": "local",
-                "version": "0.1.9",
-                "buildId": "local-rebuild-0.1.9-free-port",
+                "version": "0.1.10",
+                "buildId": "local-rebuild-0.1.10-free-port",
             ],
             "geometry": [
                 "width": w,
