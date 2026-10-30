@@ -86,7 +86,7 @@ final class BaseRuntime {
             isRunning = true
             if notifyStatus {
                 let ips = LanAddress.ipv4List().joined(separator: ", ")
-                notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.10-free-port\ndeviceId=\(cachedDeviceId)")
+                notify("服务已启动 · \(ips.isEmpty ? "无IP" : ips):\(port)\nbuild=0.1.11-kill-direct\ndeviceId=\(cachedDeviceId)")
             }
             return true
         } catch {
@@ -136,8 +136,8 @@ final class BaseRuntime {
             "licenseRequired": false,
             "release": [
                 "product": "local",
-                "version": "0.1.10",
-                "buildId": "local-rebuild-0.1.10-free-port",
+                "version": "0.1.11",
+                "buildId": "local-rebuild-0.1.11-kill-direct",
             ],
             "geometry": [
                 "width": w,

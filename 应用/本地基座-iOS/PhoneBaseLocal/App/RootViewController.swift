@@ -162,7 +162,8 @@ final class RootViewController: UIViewController {
                 if ok {
                     lines.append("已重新启动本服务 ✓")
                 } else {
-                    lines.append("启动仍失败 bind：请多任务划掉其它基座 / 卸载 Direct 后重开")
+                    lines.append("启动仍失败：手机上的 Direct(LanCaptureHelper) 占着 11019")
+                    lines.append("请到 TrollStore 卸载 Direct / PhoneBaseDirect 后重开本应用")
                 }
                 self.statusLabel.text = lines.joined(separator: "\n")
                 self.freePortButton.isEnabled = true
@@ -206,7 +207,7 @@ final class RootViewController: UIViewController {
             return "\n⚠️ 11019 被其它 PhoneBase/Direct 占用\n请点上方「释放端口占用」\n"
         }
         if !oursRunning, lower.contains("http 200") {
-            return "\n⚠️ 本进程未监听，但 11019 有其它服务\n请点上方「释放端口占用」\n"
+            return "\n⚠️ 11019 被 Direct 助手占用（也会回 lan-phonebase）\n先点「释放端口占用」；不行就卸载 Direct\n"
         }
         return "\n"
     }
