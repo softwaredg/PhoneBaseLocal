@@ -2,6 +2,8 @@ import UIKit
 
 final class RootViewController: UIViewController {
     private let runtime: BaseRuntime
+    private let scrollView = UIScrollView()
+    private let contentView = UIView()
     private let titleLabel = UILabel()
     private let statusLabel = UILabel()
     private let ipLabel = UILabel()
@@ -22,6 +24,13 @@ final class RootViewController: UIViewController {
         super.viewDidLoad()
         view.backgroundColor = UIColor(red: 0.07, green: 0.09, blue: 0.11, alpha: 1)
 
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.alwaysBounceVertical = true
+        scrollView.keyboardDismissMode = .onDrag
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(scrollView)
+        scrollView.addSubview(contentView)
+
         titleLabel.text = "本地基座"
         titleLabel.font = .systemFont(ofSize: 28, weight: .bold)
         titleLabel.textColor = .white
@@ -37,33 +46,52 @@ final class RootViewController: UIViewController {
         selfTestLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         selfTestLabel.textColor = UIColor(red: 0.85, green: 0.75, blue: 0.35, alpha: 1)
         selfTestLabel.numberOfLines = 0
-        selfTestLabel.text = "若启动失败 bind(48)：先点「释放端口占用」"
+        selfTestLabel.text = "若启动失败 bind(48)：向下滑，点「释放端口占用」"
+
+        // 按钮放上面，避免被超长自检日志顶出屏幕
+        freePortButton.setTitle("释放端口占用", for: .normal)
+        stylePrimary(freePortButton, color: UIColor(red: 0.85, green: 0.45, blue: 0.15, alpha: 1))
+        freePortButton.addTarget(self, action: #selector(freePort), for: .touchUpInside)
 
         toggleButton.setTitle(runtime.isRunning ? "停止服务" : "启动服务", for: .normal)
         stylePrimary(toggleButton, color: UIColor(red: 0.18, green: 0.62, blue: 0.48, alpha: 1))
         toggleButton.addTarget(self, action: #selector(toggle), for: .touchUpInside)
-
-        freePortButton.setTitle("释放端口占用", for: .normal)
-        stylePrimary(freePortButton, color: UIColor(red: 0.85, green: 0.45, blue: 0.15, alpha: 1))
-        freePortButton.addTarget(self, action: #selector(freePort), for: .touchUpInside)
 
         selfTestButton.setTitle("本机自检", for: .normal)
         stylePrimary(selfTestButton, color: UIColor(red: 0.20, green: 0.45, blue: 0.85, alpha: 1))
         selfTestButton.addTarget(self, action: #selector(runSelfTest), for: .touchUpInside)
 
         let stack = UIStackView(arrangedSubviews: [
-            titleLabel, statusLabel, ipLabel, selfTestLabel, toggleButton, freePortButton, selfTestButton,
+            titleLabel,
+            freePortButton,
+            toggleButton,
+            selfTestButton,
+            statusLabel,
+            ipLabel,
+            selfTestLabel,
         ])
         stack.axis = .vertical
         stack.spacing = 14
-        stack.alignment = .leading
+        stack.alignment = .fill
         stack.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(stack)
+        contentView.addSubview(stack)
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -24),
-            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 36),
+            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+
+            contentView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            contentView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            contentView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            contentView.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
+
+            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
+            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
+            stack.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -40),
         ])
 
         runtime.onStatus = { [weak self] text in
@@ -128,11 +156,7 @@ final class RootViewController: UIViewController {
                 lines.append(contentsOf: result.notes)
                 self.statusLabel.text = lines.joined(separator: "\n")
 
-                // 端口空了就自动拉起本服务
-                if result.portFree {
-                    self.runtime.start()
-                    self.toggleButton.setTitle(self.runtime.isRunning ? "停止服务" : "启动服务", for: .normal)
-                } else if wasRunning {
+                if result.portFree || wasRunning {
                     self.runtime.start()
                     self.toggleButton.setTitle(self.runtime.isRunning ? "停止服务" : "启动服务", for: .normal)
                 }
@@ -149,17 +173,18 @@ final class RootViewController: UIViewController {
         let lan = LanAddress.ipv4List().first
         let oursRunning = runtime.isRunning
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let local = Self.fetch("http://127.0.0.1:\(port)/api/health")
+            // 只取摘要，避免整段商业基座 JSON 撑爆界面
+            let local = Self.fetchSummary("http://127.0.0.1:\(port)/api/health")
             let lanResult: String
             if let lan {
-                lanResult = Self.fetch("http://\(lan):\(port)/api/health")
+                lanResult = Self.fetchSummary("http://\(lan):\(port)/api/health")
             } else {
                 lanResult = "无局域网 IP"
             }
             let warn = Self.conflictHint(localBody: local, oursRunning: oursRunning)
             DispatchQueue.main.async {
                 self?.selfTestLabel.text =
-                    "本机自检\n127.0.0.1 → \(local)\nLAN → \(lanResult)\n\(warn)\n电脑连入时应出现「有连接 #N」"
+                    "本机自检\n127.0.0.1 → \(local)\nLAN → \(lanResult)\n\(warn)\n可向下滑动查看更多"
             }
         }
     }
@@ -170,17 +195,18 @@ final class RootViewController: UIViewController {
             lower.contains("phone-direct")
             || lower.contains("cloud-wss")
             || lower.contains("dtls-srtp")
-            || (lower.contains("\"protocol\"") && !lower.contains("lan-phonebase"))
-        if foreign {
-            return "\n⚠️ 11019 被其它 PhoneBase/Direct 占用\n请点「释放端口占用」，或手动卸载那个 App\n"
+            || (lower.contains("foreign") || lower.contains("其它基座"))
+            || (lower.contains("\"protocol\"") && !lower.contains("lan-phonebase") && lower.contains("http 200"))
+        if foreign || lower.contains("其它基座") {
+            return "\n⚠️ 11019 被其它 PhoneBase/Direct 占用\n请点上方「释放端口占用」\n"
         }
         if !oursRunning, lower.contains("http 200") {
-            return "\n⚠️ 本进程未监听，但 11019 有其它服务\n请点「释放端口占用」\n"
+            return "\n⚠️ 本进程未监听，但 11019 有其它服务\n请点上方「释放端口占用」\n"
         }
         return "\n"
     }
 
-    private static func fetch(_ url: String) -> String {
+    private static func fetchSummary(_ url: String) -> String {
         guard let u = URL(string: url) else { return "bad-url" }
         var req = URLRequest(url: u, timeoutInterval: 2.5)
         req.httpMethod = "GET"
@@ -194,9 +220,30 @@ final class RootViewController: UIViewController {
             }
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             let body = String(data: data ?? Data(), encoding: .utf8) ?? ""
-            out = "HTTP \(code) \(body)"
+            out = summarize(code: code, body: body)
         }.resume()
         _ = sem.wait(timeout: .now() + 3)
         return out
+    }
+
+    private static func summarize(code: Int, body: String) -> String {
+        guard code == 200, let data = body.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            let short = body.count > 120 ? String(body.prefix(120)) + "…" : body
+            return "HTTP \(code) \(short)"
+        }
+        let proto = String(describing: obj["protocol"] ?? "")
+        let publisher = String(describing: obj["publisherType"] ?? "")
+        let ok = obj["ok"] as? Bool
+        if proto == "lan-phonebase" || (ok == true && publisher.isEmpty) {
+            let accept = obj["accept"] ?? "-"
+            return "HTTP 200 lan-phonebase accept=\(accept)"
+        }
+        if !publisher.isEmpty || body.contains("cloud-wss") || body.contains("phone-direct") {
+            return "HTTP 200 其它基座 publisher=\(publisher.isEmpty ? "?" : publisher)"
+        }
+        let short = body.count > 120 ? String(body.prefix(120)) + "…" : body
+        return "HTTP \(code) \(short)"
     }
 }
