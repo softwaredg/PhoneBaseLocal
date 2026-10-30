@@ -7,6 +7,7 @@ final class RootViewController: UIViewController {
     private let ipLabel = UILabel()
     private let selfTestLabel = UILabel()
     private let toggleButton = UIButton(type: .system)
+    private let freePortButton = UIButton(type: .system)
     private let selfTestButton = UIButton(type: .system)
 
     init(runtime: BaseRuntime) {
@@ -36,18 +37,22 @@ final class RootViewController: UIViewController {
         selfTestLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         selfTestLabel.textColor = UIColor(red: 0.85, green: 0.75, blue: 0.35, alpha: 1)
         selfTestLabel.numberOfLines = 0
-        selfTestLabel.text = "点「本机自检」验证 /api/health 是否本进程在响应"
+        selfTestLabel.text = "若启动失败 bind(48)：先点「释放端口占用」"
 
-        toggleButton.setTitle("停止服务", for: .normal)
+        toggleButton.setTitle(runtime.isRunning ? "停止服务" : "启动服务", for: .normal)
         stylePrimary(toggleButton, color: UIColor(red: 0.18, green: 0.62, blue: 0.48, alpha: 1))
         toggleButton.addTarget(self, action: #selector(toggle), for: .touchUpInside)
+
+        freePortButton.setTitle("释放端口占用", for: .normal)
+        stylePrimary(freePortButton, color: UIColor(red: 0.85, green: 0.45, blue: 0.15, alpha: 1))
+        freePortButton.addTarget(self, action: #selector(freePort), for: .touchUpInside)
 
         selfTestButton.setTitle("本机自检", for: .normal)
         stylePrimary(selfTestButton, color: UIColor(red: 0.20, green: 0.45, blue: 0.85, alpha: 1))
         selfTestButton.addTarget(self, action: #selector(runSelfTest), for: .touchUpInside)
 
         let stack = UIStackView(arrangedSubviews: [
-            titleLabel, statusLabel, ipLabel, selfTestLabel, toggleButton, selfTestButton,
+            titleLabel, statusLabel, ipLabel, selfTestLabel, toggleButton, freePortButton, selfTestButton,
         ])
         stack.axis = .vertical
         stack.spacing = 14
@@ -62,15 +67,17 @@ final class RootViewController: UIViewController {
         ])
 
         runtime.onStatus = { [weak self] text in
-            DispatchQueue.main.async { self?.statusLabel.text = text }
+            DispatchQueue.main.async {
+                self?.statusLabel.text = text
+                self?.toggleButton.setTitle(self?.runtime.isRunning == true ? "停止服务" : "启动服务", for: .normal)
+            }
         }
         refreshIP()
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
             self?.refreshIP()
         }
 
-        // 启动后自动自检一次
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.runSelfTest()
         }
     }
@@ -97,15 +104,50 @@ final class RootViewController: UIViewController {
             toggleButton.setTitle("启动服务", for: .normal)
         } else {
             runtime.start()
-            toggleButton.setTitle("停止服务", for: .normal)
+            toggleButton.setTitle(runtime.isRunning ? "停止服务" : "启动服务", for: .normal)
         }
         refreshIP()
+    }
+
+    @objc private func freePort() {
+        freePortButton.isEnabled = false
+        statusLabel.text = "正在释放 \(runtime.port) 端口占用…"
+        let wasRunning = runtime.isRunning
+        if wasRunning { runtime.stop() }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let result = PortOccupancy.freePort(self.runtime.port)
+            DispatchQueue.main.async {
+                var lines: [String] = ["释放端口结果："]
+                if result.killed.isEmpty {
+                    lines.append("未杀到已知冲突进程（可能名称不同/无权限）")
+                } else {
+                    lines.append("已结束：\(result.killed.joined(separator: ", "))")
+                }
+                lines.append(contentsOf: result.notes)
+                self.statusLabel.text = lines.joined(separator: "\n")
+
+                // 端口空了就自动拉起本服务
+                if result.portFree {
+                    self.runtime.start()
+                    self.toggleButton.setTitle(self.runtime.isRunning ? "停止服务" : "启动服务", for: .normal)
+                } else if wasRunning {
+                    self.runtime.start()
+                    self.toggleButton.setTitle(self.runtime.isRunning ? "停止服务" : "启动服务", for: .normal)
+                }
+                self.freePortButton.isEnabled = true
+                self.refreshIP()
+                self.runSelfTest()
+            }
+        }
     }
 
     @objc private func runSelfTest() {
         selfTestLabel.text = "自检中…"
         let port = runtime.port
         let lan = LanAddress.ipv4List().first
+        let oursRunning = runtime.isRunning
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let local = Self.fetch("http://127.0.0.1:\(port)/api/health")
             let lanResult: String
@@ -114,10 +156,28 @@ final class RootViewController: UIViewController {
             } else {
                 lanResult = "无局域网 IP"
             }
+            let warn = Self.conflictHint(localBody: local, oursRunning: oursRunning)
             DispatchQueue.main.async {
-                self?.selfTestLabel.text = "本机自检\n127.0.0.1 → \(local)\nLAN → \(lanResult)\n\n电脑连入时上方应出现「有连接 #N」"
+                self?.selfTestLabel.text =
+                    "本机自检\n127.0.0.1 → \(local)\nLAN → \(lanResult)\n\(warn)\n电脑连入时应出现「有连接 #N」"
             }
         }
+    }
+
+    private static func conflictHint(localBody: String, oursRunning: Bool) -> String {
+        let lower = localBody.lowercased()
+        let foreign =
+            lower.contains("phone-direct")
+            || lower.contains("cloud-wss")
+            || lower.contains("dtls-srtp")
+            || (lower.contains("\"protocol\"") && !lower.contains("lan-phonebase"))
+        if foreign {
+            return "\n⚠️ 11019 被其它 PhoneBase/Direct 占用\n请点「释放端口占用」，或手动卸载那个 App\n"
+        }
+        if !oursRunning, lower.contains("http 200") {
+            return "\n⚠️ 本进程未监听，但 11019 有其它服务\n请点「释放端口占用」\n"
+        }
+        return "\n"
     }
 
     private static func fetch(_ url: String) -> String {
